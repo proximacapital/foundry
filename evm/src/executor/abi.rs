@@ -81,6 +81,7 @@ ethers::contract::abigen!(
             toString(int256)
             toString(bytes32)
             toString(bool)
+            parseJson(string, string)(bytes)
     ]"#,
 );
 pub use hevm_mod::{HEVMCalls, HEVM_ABI};

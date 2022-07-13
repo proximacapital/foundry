@@ -129,4 +129,6 @@ interface Cheats {
     function toString(bool)           external returns(string memory);
     function toString(uint256)        external returns(string memory);
     function toString(int256)         external returns(string memory);
+
+    function parseJson(string calldata, string calldata) external returns(bytes memory);
 }
