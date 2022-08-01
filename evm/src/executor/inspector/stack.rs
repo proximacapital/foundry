@@ -1,8 +1,13 @@
-use super::{Cheatcodes, CoverageCollector, Debugger, LogCollector, Tracer};
-use crate::{coverage::HitMaps, debug::DebugArena, trace::CallTraceArena};
+use super::{Cheatcodes, Debugger, LogCollector, Tracer};
+use crate::{
+    coverage::HitMaps,
+    debug::DebugArena,
+    executor::{backend::DatabaseExt, inspector::CoverageCollector},
+    trace::CallTraceArena,
+};
 use bytes::Bytes;
 use ethers::types::{Address, Log, H256};
-use revm::{db::Database, CallInputs, CreateInputs, EVMData, Gas, Inspector, Interpreter, Return};
+use revm::{CallInputs, CreateInputs, EVMData, Gas, Inspector, Interpreter, Return};
 use std::collections::BTreeMap;
 
 /// Helper macro to call the same method on multiple inspectors without resorting to dynamic
@@ -58,7 +63,7 @@ impl InspectorStack {
 
 impl<DB> Inspector<DB> for InspectorStack
 where
-    DB: Database,
+    DB: DatabaseExt,
 {
     fn initialize_interp(
         &mut self,
@@ -207,9 +212,10 @@ where
                     is_static,
                 );
 
-                // If the inspector returns a different status we assume it wants to tell us
-                // something
-                if new_status != status {
+                // If the inspector returns a different status or a revert with a non-empty message,
+                // we assume it wants to tell us something
+                if new_status != status || (new_status == Return::Revert && new_retdata != retdata)
+                {
                     return (new_status, new_gas, new_retdata)
                 }
             }

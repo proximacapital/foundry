@@ -1,7 +1,7 @@
 //! Smart caching and deduplication of requests when using a forking provider
 use revm::{db::DatabaseRef, AccountInfo, KECCAK_EMPTY};
 
-use crate::executor::fork::BlockchainDb;
+use crate::executor::fork::{cache::FlushJsonBlockCacheDB, BlockchainDb};
 use ethers::{
     core::abi::ethereum_types::BigEndianHash,
     providers::Middleware,
@@ -14,8 +14,6 @@ use futures::{
     task::{Context, Poll},
     Future, FutureExt,
 };
-
-use crate::executor::fork::cache::FlushJsonBlockCacheDB;
 use std::{
     collections::{hash_map::Entry, HashMap, VecDeque},
     pin::Pin,
@@ -24,7 +22,7 @@ use std::{
         Arc,
     },
 };
-use tracing::{trace, warn};
+use tracing::{error, trace, warn};
 
 type AccountFuture<Err> =
     Pin<Box<dyn Future<Output = (Result<(U256, U256, Bytes), Err>, Address)> + Send>>;
@@ -210,13 +208,22 @@ where
                 entry.insert(vec![listener]);
                 let provider = self.provider.clone();
                 let fut = Box::pin(async move {
-                    let res = provider.get_block(number).await;
-                    let block = res.ok().flatten();
+                    let block = provider.get_block(number).await;
+
                     let block_hash = match block {
-                        Some(block) => Ok(block
+                        Ok(Some(block)) => Ok(block
                             .hash
                             .expect("empty block hash on mined block, this should never happen")),
-                        None => Err(eyre::eyre!("block {number} not found")),
+                        Ok(None) => {
+                            warn!(target: "backendhandler", ?number, "block not found");
+                            // if no block was returned then the block does not exist, in which case
+                            // we return empty hash
+                            Ok(KECCAK_EMPTY)
+                        }
+                        Err(_) => {
+                            error!(target: "backendhandler", ?number, "failed to get block");
+                            Err(eyre::eyre!("block {number} not found"))
+                        }
                     };
                     (block_hash, number)
                 });
@@ -372,7 +379,7 @@ pub struct SharedBackend {
     ///
     /// There is only one instance of the type, so as soon as the last `SharedBackend` is deleted,
     /// `FlushJsonBlockCacheDB` is also deleted and the cache is flushed.
-    _cache: Arc<FlushJsonBlockCacheDB>,
+    cache: Arc<FlushJsonBlockCacheDB>,
 }
 
 impl SharedBackend {
@@ -434,9 +441,9 @@ impl SharedBackend {
         M: Middleware + Unpin + 'static + Clone,
     {
         let (backend, backend_rx) = channel(1);
-        let _cache = Arc::new(FlushJsonBlockCacheDB(Arc::clone(db.cache())));
+        let cache = Arc::new(FlushJsonBlockCacheDB(Arc::clone(db.cache())));
         let handler = BackendHandler::new(provider, db, backend_rx, pin_block);
-        (Self { backend, _cache }, handler)
+        (Self { backend, cache }, handler)
     }
 
     /// Updates the pinned block to fetch data from
@@ -473,14 +480,18 @@ impl SharedBackend {
             Ok(rx.recv()?)
         })
     }
+
+    /// Flushes the DB to disk if caching is enabled
+    pub(crate) fn flush_cache(&self) {
+        self.cache.0.flush();
+    }
 }
 
 impl DatabaseRef for SharedBackend {
     fn basic(&self, address: H160) -> AccountInfo {
         trace!( target: "sharedbackend", "request basic {:?}", address);
         self.do_get_basic(address).unwrap_or_else(|_| {
-            warn!( target: "sharedbackend", "Failed to send/recv `basic` for {}", address);
-            Default::default()
+            panic!("Failed to send/recv `basic` for {address}");
         })
     }
 
@@ -490,10 +501,8 @@ impl DatabaseRef for SharedBackend {
 
     fn storage(&self, address: H160, index: U256) -> U256 {
         trace!( target: "sharedbackend", "request storage {:?} at {:?}", address, index);
-        self.do_get_storage(address, index)
-            .unwrap_or_else(|_| {
-            warn!( target: "sharedbackend", "Failed to send/recv `storage` for {} at {}", address, index);
-            Default::default()
+        self.do_get_storage(address, index).unwrap_or_else(|_| {
+            panic!("Failed to send/recv `storage` for {address} at {index}");
         })
     }
 
@@ -504,8 +513,7 @@ impl DatabaseRef for SharedBackend {
         let number = number.as_u64();
         trace!( target: "sharedbackend", "request block hash for number {:?}", number);
         self.do_get_block_hash(number).unwrap_or_else(|_| {
-            warn!( target: "sharedbackend", "Failed to send/recv `block_hash` for {}", number);
-            Default::default()
+            panic!("Failed to send/recv `block_hash` for {number}");
         })
     }
 }
@@ -514,7 +522,8 @@ impl DatabaseRef for SharedBackend {
 mod tests {
     use crate::executor::{
         fork::{BlockchainDbMeta, JsonBlockCacheDB},
-        Fork,
+        opts::EvmOpts,
+        Backend,
     };
     use ethers::{
         providers::{Http, Provider},
@@ -522,6 +531,9 @@ mod tests {
         types::Address,
     };
 
+    use crate::executor::fork::CreateFork;
+    use ethers::types::Chain;
+    use foundry_config::Config;
     use std::{collections::BTreeSet, convert::TryFrom, path::PathBuf, sync::Arc};
 
     use super::*;
@@ -579,25 +591,26 @@ mod tests {
         assert!(!json.db().accounts.read().is_empty());
     }
 
-    #[test]
-    fn can_read_write_cache() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn can_read_write_cache() {
         let provider = Provider::<Http>::try_from(ENDPOINT).unwrap();
-        let tmpdir = tempfile::tempdir().unwrap();
-        let cache_path = tmpdir.path().join("storage.json");
-        let runtime = RuntimeOrHandle::new();
 
-        let block_num = runtime.block_on(provider.get_block_number()).unwrap().as_u64();
-        let env = revm::Env::default();
+        let block_num = provider.get_block_number().await.unwrap().as_u64();
 
-        let fork = Fork {
-            cache_path: Some(cache_path.clone()),
+        let config = Config::figment();
+        let mut evm_opts = config.extract::<EvmOpts>().unwrap();
+        evm_opts.fork_block_number = Some(block_num);
+
+        let env = evm_opts.fork_evm_env(ENDPOINT).await.unwrap();
+
+        let fork = CreateFork {
+            enable_caching: true,
             url: ENDPOINT.to_string(),
-            pin_block: Some(block_num),
-            chain_id: 1,
-            initial_backoff: 50,
+            env: env.clone(),
+            evm_opts,
         };
 
-        let backend = runtime.block_on(fork.spawn_backend(&env));
+        let backend = Backend::spawn(Some(fork));
 
         // some rng contract from etherscan
         let address: Address = "63091244180ae240c87d1f528f5f269134cb07b3".parse().unwrap();
@@ -612,15 +625,14 @@ mod tests {
             let _ = backend.storage(address, idx.into());
         }
         drop(backend);
-        drop(runtime);
 
-        let meta = BlockchainDbMeta {
-            cfg_env: Default::default(),
-            block_env: revm::BlockEnv { number: block_num.into(), ..Default::default() },
-            hosts: Default::default(),
-        };
+        let meta =
+            BlockchainDbMeta { cfg_env: env.cfg, block_env: env.block, hosts: Default::default() };
 
-        let db = BlockchainDb::new(meta, Some(cache_path));
+        let db = BlockchainDb::new(
+            meta,
+            Some(Config::foundry_block_cache_dir(Chain::Mainnet, block_num).unwrap()),
+        );
         assert!(db.accounts().read().contains_key(&address));
         assert!(db.storage().read().contains_key(&address));
         assert_eq!(db.storage().read().get(&address).unwrap().len(), num_slots as usize);

@@ -6,12 +6,14 @@ use ethers::{
 };
 use forge::executor::opts::EvmOpts;
 use foundry_config::{figment::Figment, Config};
+use tracing::trace;
 
 use super::{sequence::ScriptSequence, *};
 
 impl ScriptArgs {
     /// Executes the script
     pub async fn run_script(mut self) -> eyre::Result<()> {
+        trace!("executing script command");
         let figment: Figment = From::from(&self);
         let evm_opts = figment.extract::<EvmOpts>()?;
         let mut script_config = ScriptConfig {
@@ -20,6 +22,7 @@ impl ScriptArgs {
             config: Config::from_provider(figment).sanitized(),
             evm_opts,
             called_function: None,
+            backend: None,
         };
 
         self.maybe_load_private_key(&mut script_config)?;
@@ -149,7 +152,7 @@ impl ScriptArgs {
                     result,
                     libraries,
                     &mut decoder,
-                    &script_config,
+                    script_config,
                     verify,
                 )
                 .await?;

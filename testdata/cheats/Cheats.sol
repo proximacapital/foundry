@@ -2,6 +2,8 @@
 pragma solidity >=0.8.0;
 
 interface Cheats {
+    // This allows us to getRecordedLogs()
+    struct Log {bytes32[] topics; bytes data;}
     // Set block.timestamp (newTimestamp)
     function warp(uint256) external;
     // Set block.height (newHeight)
@@ -18,6 +20,10 @@ interface Cheats {
     function sign(uint256,bytes32) external returns (uint8,bytes32,bytes32);
     // Gets address for a given private key, (privateKey) => (address)
     function addr(uint256) external returns (address);
+    // Derive a private key from a provided mnenomic string (or mnenomic file path) at the derivation path m/44'/60'/0'/0/{index}
+    function deriveKey(string calldata, uint32) external returns (uint256);
+    // Derive a private key from a provided mnenomic string (or mnenomic file path) at the derivation path {path}{index}
+    function deriveKey(string calldata, string calldata, uint32) external returns (uint256);
     // Performs a foreign function call via terminal, (stringInputs) => (result)
     function ffi(string[] calldata) external returns (bytes memory);
     // Set environment variables, (name, value)
@@ -60,6 +66,10 @@ interface Cheats {
     function record() external;
     // Gets all accessed reads and write slot from a recording session, for a given address
     function accesses(address) external returns (bytes32[] memory reads, bytes32[] memory writes);
+    // Record all the transaction logs
+    function recordLogs() external;
+    // Gets all the recorded logs
+    function getRecordedLogs() external returns (Log[] memory);
     // Prepare an expected log with (bool checkTopic1, bool checkTopic2, bool checkTopic3, bool checkData).
     // Call this function, then emit an event, then call a function. Internally after the call, we check if
     // logs were emitted in the expected order with the expected topics and data (as specified by the booleans).
@@ -132,4 +142,46 @@ interface Cheats {
 
     function parseJson(string calldata, string calldata) external returns(bytes memory);
     function parseJson(string calldata) external returns(bytes memory);
+
+    // Snapshot the current state of the evm.
+    // Returns the id of the snapshot that was created.
+    // To revert a snapshot use `revertTo`
+    function snapshot() external returns(uint256);
+    // Revert the state of the evm to a previous snapshot
+    // Takes the snapshot id to revert to.
+    // This deletes the snapshot and all snapshots taken after the given snapshot id.
+    function revertTo(uint256) external returns(bool);
+    // Creates a new fork with the given endpoint and block and returns the identifier of the fork
+    function createFork(string calldata,uint256) external returns(uint256);
+    // Creates a new fork with the given endpoint and the _latest_ block and returns the identifier of the fork
+    function createFork(string calldata) external returns(uint256);
+    // Creates _and_ also selects a new fork with the given endpoint and block and returns the identifier of the fork
+    function createSelectFork(string calldata,uint256) external returns(uint256);
+    // Creates _and_ also selects a new fork with the given endpoint and the latest block and returns the identifier of the fork
+    function createSelectFork(string calldata) external returns(uint256);
+    // Takes a fork identifier created by `createFork` and sets the corresponding forked state as active.
+    function selectFork(uint256) external;
+    // Returns the currently active fork
+    // Reverts if no fork is currently active
+    function activeFork() external returns(uint256);
+    // Marks that the account(s) should use persistent storage across fork swaps.
+    // Meaning, changes made to the state of this account will be kept when switching forks
+    function makePersistent(address) external;
+    function makePersistent(address, address) external;
+    function makePersistent(address, address, address) external;
+    function makePersistent(address[] calldata) external;
+    // Revokes persistent status from the address, previously added via `makePersistent`
+    function revokePersistent(address) external;
+    function revokePersistent(address[] calldata) external;
+    // Returns true if the account is marked as persistent
+    function isPersistent(address) external returns (bool);
+    // Updates the currently active fork to given block number
+    // This is similar to `roll` but for the currently active fork
+    function rollFork(uint256) external;
+    // Updates the given fork to given block number
+    function rollFork(uint256 forkId, uint256 blockNumber) external;
+    /// Returns the RPC url for the given alias
+    function rpcUrl(string calldata) external returns(string memory);
+    /// Returns all rpc urls and their aliases `[alias, url][]`
+    function rpcUrls() external returns(string[2][] memory);
 }

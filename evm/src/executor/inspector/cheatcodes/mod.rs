@@ -1,17 +1,3 @@
-/// Cheatcodes related to the execution environment.
-mod env;
-pub use env::{Prank, RecordAccess};
-/// Assertion helpers (such as `expectEmit`)
-mod expect;
-pub use expect::{ExpectedCallData, ExpectedEmit, ExpectedRevert, MockCallDataContext};
-/// Cheatcodes that interact with the external environment (FFI etc.)
-mod ext;
-/// Cheatcodes that configure the fuzzer
-mod fuzz;
-/// Utility cheatcodes (`sign` etc.)
-mod util;
-pub use util::{DEFAULT_CREATE2_DEPLOYER, MISSING_CREATE2_DEPLOYER};
-
 use self::{
     env::Broadcast,
     expect::{handle_expect_emit, handle_expect_revert},
@@ -19,7 +5,10 @@ use self::{
 };
 use crate::{
     abi::HEVMCalls,
-    executor::{CHEATCODE_ADDRESS, HARDHAT_CONSOLE_ADDRESS},
+    executor::{
+        backend::DatabaseExt, inspector::cheatcodes::env::RecordedLogs, CHEATCODE_ADDRESS,
+        HARDHAT_CONSOLE_ADDRESS,
+    },
 };
 use bytes::Bytes;
 use ethers::{
@@ -30,8 +19,8 @@ use ethers::{
     },
 };
 use revm::{
-    opcode, BlockEnv, CallInputs, CreateInputs, Database, EVMData, Gas, Inspector, Interpreter,
-    Return,
+    opcode, BlockEnv, CallInputs, CreateInputs, EVMData, Gas, Inspector, Interpreter, Return,
+    TransactTo,
 };
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -41,7 +30,27 @@ use std::{
     sync::Arc,
 };
 
+/// Cheatcodes related to the execution environment.
+mod env;
+pub use env::{Prank, RecordAccess};
+/// Assertion helpers (such as `expectEmit`)
+mod expect;
+pub use expect::{ExpectedCallData, ExpectedEmit, ExpectedRevert, MockCallDataContext};
+
+/// Cheatcodes that interact with the external environment (FFI etc.)
+mod ext;
+/// Fork related cheatcodes
+mod fork;
+/// Cheatcodes that configure the fuzzer
+mod fuzz;
+/// Snapshot related cheatcodes
+mod snapshot;
+/// Utility cheatcodes (`sign` etc.)
+pub mod util;
+pub use util::{DEFAULT_CREATE2_DEPLOYER, MISSING_CREATE2_DEPLOYER};
+
 mod config;
+use crate::executor::backend::RevertDiagnostic;
 pub use config::CheatsConfig;
 
 /// An inspector that handles calls to various cheatcodes, each with their own behavior.
@@ -71,8 +80,14 @@ pub struct Cheatcodes {
     /// Expected revert information
     pub expected_revert: Option<ExpectedRevert>,
 
+    /// Additional diagnostic for reverts
+    pub fork_revert_diagnostic: Option<RevertDiagnostic>,
+
     /// Recorded storage reads and writes
     pub accesses: Option<RecordAccess>,
+
+    /// Recorded logs
+    pub recorded_logs: Option<RecordedLogs>,
 
     /// Mocked calls
     pub mocked_calls: BTreeMap<Address, BTreeMap<MockCallDataContext, Bytes>>,
@@ -123,7 +138,7 @@ impl Cheatcodes {
         }
     }
 
-    fn apply_cheatcode<DB: Database>(
+    fn apply_cheatcode<DB: DatabaseExt>(
         &mut self,
         data: &mut EVMData<'_, DB>,
         caller: Address,
@@ -138,14 +153,86 @@ impl Cheatcodes {
             .or_else(|| expect::apply(self, data, &decoded))
             .or_else(|| fuzz::apply(data, &decoded))
             .or_else(|| ext::apply(self, self.config.ffi, &decoded))
+            .or_else(|| snapshot::apply(self, data, &decoded))
+            .or_else(|| fork::apply(self, data, &decoded))
             .ok_or_else(|| "Cheatcode was unhandled. This is a bug.".to_string().encode())?
     }
 }
 
 impl<DB> Inspector<DB> for Cheatcodes
 where
-    DB: Database,
+    DB: DatabaseExt,
 {
+    fn initialize_interp(
+        &mut self,
+        _: &mut Interpreter,
+        data: &mut EVMData<'_, DB>,
+        _: bool,
+    ) -> Return {
+        // When the first interpreter is initialized we've circumvented the balance and gas checks,
+        // so we apply our actual block data with the correct fees and all.
+        if let Some(block) = self.block.take() {
+            data.env.block = block;
+        }
+        if let Some(gas_price) = self.gas_price.take() {
+            data.env.tx.gas_price = gas_price;
+        }
+
+        Return::Continue
+    }
+
+    fn step(&mut self, interpreter: &mut Interpreter, _: &mut EVMData<'_, DB>, _: bool) -> Return {
+        // Record writes and reads if `record` has been called
+        if let Some(storage_accesses) = &mut self.accesses {
+            match interpreter.contract.code[interpreter.program_counter()] {
+                opcode::SLOAD => {
+                    let key = try_or_continue!(interpreter.stack().peek(0));
+                    storage_accesses
+                        .reads
+                        .entry(interpreter.contract().address)
+                        .or_insert_with(Vec::new)
+                        .push(key);
+                }
+                opcode::SSTORE => {
+                    let key = try_or_continue!(interpreter.stack().peek(0));
+
+                    // An SSTORE does an SLOAD internally
+                    storage_accesses
+                        .reads
+                        .entry(interpreter.contract().address)
+                        .or_insert_with(Vec::new)
+                        .push(key);
+                    storage_accesses
+                        .writes
+                        .entry(interpreter.contract().address)
+                        .or_insert_with(Vec::new)
+                        .push(key);
+                }
+                _ => (),
+            }
+        }
+
+        Return::Continue
+    }
+
+    fn log(&mut self, _: &mut EVMData<'_, DB>, address: &Address, topics: &[H256], data: &Bytes) {
+        // Match logs if `expectEmit` has been called
+        if !self.expected_emits.is_empty() {
+            handle_expect_emit(
+                self,
+                RawLog { topics: topics.to_vec(), data: data.to_vec() },
+                address,
+            );
+        }
+
+        // Stores this log if `recordLogs` has been called
+        if let Some(storage_recorded_logs) = &mut self.recorded_logs {
+            storage_recorded_logs
+                .entries
+                .push(RawLog { topics: topics.to_vec(), data: data.to_vec() });
+        }
+    }
+
     fn call(
         &mut self,
         data: &mut EVMData<'_, DB>,
@@ -247,7 +334,7 @@ where
                             .to_string()
                             .encode()
                             .into()
-                        )
+                        );
                     }
                 }
             }
@@ -255,69 +342,6 @@ where
             (Return::Continue, Gas::new(call.gas_limit), Bytes::new())
         } else {
             (Return::Continue, Gas::new(call.gas_limit), Bytes::new())
-        }
-    }
-
-    fn initialize_interp(
-        &mut self,
-        _: &mut Interpreter,
-        data: &mut EVMData<'_, DB>,
-        _: bool,
-    ) -> Return {
-        // When the first interpreter is initialized we've circumvented the balance and gas checks,
-        // so we apply our actual block data with the correct fees and all.
-        if let Some(block) = self.block.take() {
-            data.env.block = block;
-        }
-        if let Some(gas_price) = self.gas_price.take() {
-            data.env.tx.gas_price = gas_price;
-        }
-
-        Return::Continue
-    }
-
-    fn step(&mut self, interpreter: &mut Interpreter, _: &mut EVMData<'_, DB>, _: bool) -> Return {
-        // Record writes and reads if `record` has been called
-        if let Some(storage_accesses) = &mut self.accesses {
-            match interpreter.contract.code[interpreter.program_counter()] {
-                opcode::SLOAD => {
-                    let key = try_or_continue!(interpreter.stack().peek(0));
-                    storage_accesses
-                        .reads
-                        .entry(interpreter.contract().address)
-                        .or_insert_with(Vec::new)
-                        .push(key);
-                }
-                opcode::SSTORE => {
-                    let key = try_or_continue!(interpreter.stack().peek(0));
-
-                    // An SSTORE does an SLOAD internally
-                    storage_accesses
-                        .reads
-                        .entry(interpreter.contract().address)
-                        .or_insert_with(Vec::new)
-                        .push(key);
-                    storage_accesses
-                        .writes
-                        .entry(interpreter.contract().address)
-                        .or_insert_with(Vec::new)
-                        .push(key);
-                }
-                _ => (),
-            }
-        }
-
-        Return::Continue
-    }
-
-    fn log(&mut self, _: &mut EVMData<'_, DB>, address: &Address, topics: &[H256], data: &Bytes) {
-        // Match logs if `expectEmit` has been called
-        if !self.expected_emits.is_empty() {
-            handle_expect_emit(
-                self,
-                RawLog { topics: topics.to_vec(), data: data.to_vec() },
-                address,
-            );
         }
     }
 
@@ -409,6 +433,30 @@ where
                         .encode()
                         .into(),
                 )
+            }
+        }
+
+        // if there's a revert and a previous call was diagnosed as fork related revert then we can
+        // return a better error here
+        if status == Return::Revert {
+            if let Some(err) = self.fork_revert_diagnostic.take() {
+                return (status, remaining_gas, err.to_error_msg(self).encode().into())
+            }
+        }
+
+        // this will ensure we don't have false positives when trying to diagnose reverts in fork
+        // mode
+        let _ = self.fork_revert_diagnostic.take();
+
+        // try to diagnose reverts in multi-fork mode where a call is made to an address that does
+        // not exist
+        if let TransactTo::Call(test_contract) = data.env.tx.transact_to {
+            // if a call to a different contract than the original test contract returned with
+            // `Stop` we check if the contract actually exists on the active fork
+            if data.db.is_forked_mode() && status == Return::Stop && call.contract != test_contract
+            {
+                self.fork_revert_diagnostic =
+                    data.db.diagnose_revert(call.contract, &data.subroutine);
             }
         }
 

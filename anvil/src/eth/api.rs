@@ -26,7 +26,6 @@ use crate::{
 use anvil_core::{
     eth::{
         block::BlockInfo,
-        call::CallRequest,
         transaction::{
             EthTransactionRequest, LegacyTransaction, PendingTransaction, TypedTransaction,
             TypedTransactionRequest,
@@ -41,11 +40,13 @@ use ethers::{
     prelude::TxpoolInspect,
     providers::{Http, ProviderError, RetryClient},
     types::{
-        transaction::eip2930::{AccessList, AccessListItem, AccessListWithGasUsed},
+        transaction::{
+            eip2930::{AccessList, AccessListItem, AccessListWithGasUsed},
+            eip712::TypedData,
+        },
         Address, Block, BlockId, BlockNumber, Bytes, FeeHistory, Filter, FilteredParams, Log,
-        Trace, Transaction, TransactionReceipt, TransactionRequest as EthersTransactionRequest,
-        TransactionRequest, TxHash, TxpoolContent, TxpoolInspectSummary, TxpoolStatus, H256, U256,
-        U64,
+        Trace, Transaction, TransactionReceipt, TxHash, TxpoolContent, TxpoolInspectSummary,
+        TxpoolStatus, TxpoolTransaction, H256, U256, U64,
     },
     utils::rlp,
 };
@@ -56,7 +57,7 @@ use foundry_evm::{
 use futures::channel::mpsc::Receiver;
 use parking_lot::RwLock;
 use std::{sync::Arc, time::Duration};
-use tracing::trace;
+use tracing::{trace, warn};
 
 /// The client version: `anvil/v{major}.{minor}.{patch}`
 pub const CLIENT_VERSION: &str = concat!("anvil/v", env!("CARGO_PKG_VERSION"));
@@ -127,7 +128,7 @@ impl EthApi {
 
     /// Executes the [EthRequest] and returns an RPC [RpcResponse]
     pub async fn execute(&self, request: EthRequest) -> ResponseResult {
-        trace!(target: "rpc::api", "executing eth request {:?}", request);
+        trace!(target: "rpc::api", "executing eth request");
         match request {
             EthRequest::Web3ClientVersion(()) => self.client_version().to_rpc_result(),
             EthRequest::Web3Sha3(content) => self.sha3(content).to_rpc_result(),
@@ -182,6 +183,15 @@ impl EthApi {
                 self.get_code(addr, block).await.to_rpc_result()
             }
             EthRequest::EthSign(addr, content) => self.sign(addr, content).await.to_rpc_result(),
+            EthRequest::EthSignTypedData(addr, data) => {
+                self.sign_typed_data(addr, data).await.to_rpc_result()
+            }
+            EthRequest::EthSignTypedDataV3(addr, data) => {
+                self.sign_typed_data_v3(addr, data).await.to_rpc_result()
+            }
+            EthRequest::EthSignTypedDataV4(addr, data) => {
+                self.sign_typed_data_v4(addr, &data).await.to_rpc_result()
+            }
             EthRequest::EthSendRawTransaction(tx) => self.send_raw_transaction(tx).to_rpc_result(),
             EthRequest::EthCall(call, block) => self.call(call, block).await.to_rpc_result(),
             EthRequest::EthCreateAccessList(call, block) => {
@@ -207,6 +217,7 @@ impl EthApi {
             }
             EthRequest::EthGetLogs(filter) => self.logs(filter).await.to_rpc_result(),
             EthRequest::EthGetWork(_) => self.work().to_rpc_result(),
+            EthRequest::EthSyncing(_) => self.syncing().to_rpc_result(),
             EthRequest::EthSubmitWork(nonce, pow, digest) => {
                 self.submit_work(nonce, pow, digest).to_rpc_result()
             }
@@ -242,7 +253,9 @@ impl EthApi {
             EthRequest::DropTransaction(tx) => {
                 self.anvil_drop_transaction(tx).await.to_rpc_result()
             }
-            EthRequest::Reset(fork) => self.anvil_reset(fork).await.to_rpc_result(),
+            EthRequest::Reset(fork) => {
+                self.anvil_reset(fork.and_then(|p| p.params)).await.to_rpc_result()
+            }
             EthRequest::SetBalance(addr, val) => {
                 self.anvil_set_balance(addr, val).await.to_rpc_result()
             }
@@ -263,6 +276,8 @@ impl EthApi {
             EthRequest::SetNextBlockBaseFeePerGas(gas) => {
                 self.anvil_set_next_block_base_fee_per_gas(gas).await.to_rpc_result()
             }
+            EthRequest::DumpState(_) => self.anvil_dump_state().await.to_rpc_result(),
+            EthRequest::LoadState(buf) => self.anvil_load_state(buf).await.to_rpc_result(),
             EthRequest::EvmSnapshot(_) => self.evm_snapshot().await.to_rpc_result(),
             EthRequest::EvmRevert(id) => self.evm_revert(id).await.to_rpc_result(),
             EthRequest::EvmIncreaseTime(time) => self.evm_increase_time(time).await.to_rpc_result(),
@@ -542,6 +557,40 @@ impl EthApi {
         self.backend.get_code(address, Some(number.into())).await
     }
 
+    /// Signs data via [EIP-712](https://github.com/ethereum/EIPs/blob/master/EIPS/eip-712.md).
+    ///
+    /// Handler for ETH RPC call: `eth_signTypedData`
+    pub async fn sign_typed_data(
+        &self,
+        _address: Address,
+        _data: serde_json::Value,
+    ) -> Result<String> {
+        node_info!("eth_signTypedData");
+        Err(BlockchainError::RpcUnimplemented)
+    }
+
+    /// Signs data via [EIP-712](https://github.com/ethereum/EIPs/blob/master/EIPS/eip-712.md).
+    ///
+    /// Handler for ETH RPC call: `eth_signTypedData_v3`
+    pub async fn sign_typed_data_v3(
+        &self,
+        _address: Address,
+        _data: serde_json::Value,
+    ) -> Result<String> {
+        node_info!("eth_signTypedData_v3");
+        Err(BlockchainError::RpcUnimplemented)
+    }
+
+    /// Signs data via [EIP-712](https://github.com/ethereum/EIPs/blob/master/EIPS/eip-712.md), and includes full support of arrays and recursive data structures.
+    ///
+    /// Handler for ETH RPC call: `eth_signTypedData_v4`
+    pub async fn sign_typed_data_v4(&self, address: Address, data: &TypedData) -> Result<String> {
+        node_info!("eth_signTypedData_v4");
+        let signer = self.get_signer(address).ok_or(BlockchainError::NoSignerAvailable)?;
+        let signature = signer.sign_typed_data(address, data).await?;
+        Ok(format!("0x{}", signature))
+    }
+
     /// The sign method calculates an Ethereum specific signature
     ///
     /// Handler for ETH RPC call: `eth_sign`
@@ -570,7 +619,7 @@ impl EthApi {
         let pending_transaction = if self.is_impersonated(from) {
             let bypass_signature = self.backend.cheats().bypass_signature();
             let transaction = sign::build_typed_transaction(request, bypass_signature)?;
-            trace!(target : "node", "eth_sendTransaction: impersonating {:?}", from);
+            trace!(target : "node", ?from, "eth_sendTransaction: impersonating");
             PendingTransaction::with_sender(transaction, from)
         } else {
             let transaction = self.sign_request(&from, request)?;
@@ -640,7 +689,11 @@ impl EthApi {
     /// Call contract, returning the output data.
     ///
     /// Handler for ETH RPC call: `eth_call`
-    pub async fn call(&self, request: CallRequest, block_number: Option<BlockId>) -> Result<Bytes> {
+    pub async fn call(
+        &self,
+        request: EthTransactionRequest,
+        block_number: Option<BlockId>,
+    ) -> Result<Bytes> {
         node_info!("eth_call");
         let number = self.backend.ensure_block_number(block_number)?;
         let block_number = Some(number.into());
@@ -680,7 +733,7 @@ impl EthApi {
     /// Handler for ETH RPC call: `eth_createAccessList`
     pub async fn create_access_list(
         &self,
-        mut request: CallRequest,
+        mut request: EthTransactionRequest,
         block_number: Option<BlockId>,
     ) -> Result<AccessListWithGasUsed> {
         node_info!("eth_createAccessList");
@@ -716,16 +769,14 @@ impl EthApi {
                 let storage_keys = acc.storage.into_keys().map(u256_to_h256_be).collect();
                 AccessListItem { address, storage_keys }
             })
-            .collect();
-
-        let access_list = AccessList(items);
+            .collect::<Vec<_>>();
 
         // execute again but with access list set
-        request.access_list = Some(access_list.clone());
+        request.access_list = Some(items.clone());
 
         let gas_used = self.do_estimate_gas(request, Some(number.into())).await?;
 
-        Ok(AccessListWithGasUsed { access_list, gas_used })
+        Ok(AccessListWithGasUsed { access_list: AccessList(items), gas_used })
     }
 
     /// Estimate gas needed for execution of given contract.
@@ -733,7 +784,7 @@ impl EthApi {
     /// Handler for ETH RPC call: `eth_estimateGas`
     pub async fn estimate_gas(
         &self,
-        request: CallRequest,
+        request: EthTransactionRequest,
         block_number: Option<BlockId>,
     ) -> Result<U256> {
         node_info!("eth_estimateGas");
@@ -831,6 +882,14 @@ impl EthApi {
     pub fn work(&self) -> Result<Work> {
         node_info!("eth_getWork");
         Err(BlockchainError::RpcUnimplemented)
+    }
+
+    /// Returns the sync status, always be fails.
+    ///
+    /// Handler for ETH RPC call: `eth_syncing`
+    pub fn syncing(&self) -> Result<bool> {
+        node_info!("eth_syncing");
+        Ok(false)
     }
 
     /// Used for submitting a proof-of-work solution.
@@ -1250,6 +1309,24 @@ impl EthApi {
         Ok(())
     }
 
+    /// Create a bufer that represents all state on the chain, which can be loaded to separate
+    /// process by calling `anvil_laodState`
+    ///
+    /// Handler for RPC call: `anvil_dumpState`
+    pub async fn anvil_dump_state(&self) -> Result<Bytes> {
+        node_info!("anvil_dumpState");
+        self.backend.dump_state()
+    }
+
+    /// Append chain state buffer to current chain. Will overwrite any conflicting addresses or
+    /// storage.
+    ///
+    /// Handler for RPC call: `anvil_loadState`
+    pub async fn anvil_load_state(&self, buf: Bytes) -> Result<bool> {
+        node_info!("anvil_loadState");
+        self.backend.load_state(buf)
+    }
+
     /// Snapshot the state of the blockchain at the current block.
     ///
     /// Handler for RPC call: `evm_snapshot`
@@ -1458,27 +1535,22 @@ impl EthApi {
     pub async fn txpool_content(&self) -> Result<TxpoolContent> {
         node_info!("txpool_content");
         let mut content = TxpoolContent::default();
-        fn convert(tx: Arc<PoolTransaction>) -> EthersTransactionRequest {
+        fn convert(tx: Arc<PoolTransaction>) -> TxpoolTransaction {
             let from = *tx.pending_transaction.sender();
             let tx = &tx.pending_transaction.transaction;
-            let to = tx.to().copied();
-            let gas = tx.gas_limit();
-            let value = tx.value();
-            let data = tx.data();
-            let data = if data.as_ref().is_empty() { None } else { Some(data.clone()) };
-            let nonce = *tx.nonce();
-            let chain_id = tx.chain_id();
-            let gas_price = tx.gas_price();
 
-            TransactionRequest {
+            TxpoolTransaction {
+                block_hash: None,
+                block_number: None,
                 from: Some(from),
-                to: to.map(Into::into),
-                gas: Some(gas),
-                gas_price: Some(gas_price),
-                value: Some(value),
-                data,
-                nonce: Some(nonce),
-                chain_id: chain_id.map(Into::into),
+                to: tx.to().copied(),
+                gas: Some(tx.gas_limit()),
+                gas_price: Some(tx.gas_price()),
+                value: tx.value(),
+                hash: tx.hash(),
+                input: tx.data().clone(),
+                nonce: *tx.nonce(),
+                transaction_index: None,
             }
         }
 
@@ -1502,7 +1574,7 @@ impl EthApi {
 impl EthApi {
     async fn do_estimate_gas(
         &self,
-        mut request: CallRequest,
+        mut request: EthTransactionRequest,
         block_number: Option<BlockId>,
     ) -> Result<U256> {
         let number = self.backend.ensure_block_number(block_number)?;
@@ -1595,7 +1667,7 @@ impl EthApi {
                                 .into())
                         }
                         reason => {
-                            trace!(target: "node", "estimation failed due to {:?}", reason);
+                            warn!(target: "node", "estimation failed due to {:?}", reason);
                             Err(BlockchainError::EvmError(reason))
                         }
                     }
@@ -1605,7 +1677,7 @@ impl EthApi {
                 }
             }
             reason => {
-                trace!(target: "node", "estimation failed due to {:?}", reason);
+                warn!(target: "node", "estimation failed due to {:?}", reason);
                 return Err(BlockchainError::EvmError(reason))
             }
         }
@@ -1646,7 +1718,7 @@ impl EthApi {
                     lowest_gas_limit = mid_gas_limit;
                 }
                 reason => {
-                    trace!(target: "node", "estimation failed due to {:?}", reason);
+                    warn!(target: "node", "estimation failed due to {:?}", reason);
                     return Err(BlockchainError::EvmError(reason))
                 }
             }
@@ -1709,7 +1781,7 @@ impl EthApi {
         let transactions = self.pool.ready_transactions().collect::<Vec<_>>();
         let outcome = self.backend.mine_block(transactions).await;
 
-        trace!(target: "node", "mined block {}", outcome.block_number);
+        trace!(target: "node", blocknumber = ?outcome.block_number, "mined block");
         self.pool.on_mined_block(outcome);
     }
 

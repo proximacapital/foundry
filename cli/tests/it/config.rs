@@ -15,6 +15,7 @@ use foundry_config::{
     cache::{CachedChains, CachedEndpoints, StorageCachingConfig},
     Config, OptimizerDetails, SolcReq,
 };
+use path_slash::PathBufExt;
 use std::{fs, path::PathBuf, str::FromStr};
 
 // tests all config values that are in use
@@ -58,6 +59,7 @@ forgetest!(can_extract_config_values, |prj: TestProject, mut cmd: TestCommand| {
         fuzz_runs: 1000,
         fuzz_max_local_rejects: 2000,
         fuzz_max_global_rejects: 100203,
+        fuzz_seed: Some(1000.into()),
         ffi: true,
         sender: "00a329c0648769A73afAc7F9381D08FB43dBEA72".parse().unwrap(),
         tx_origin: "00a329c0648769A73afAc7F9F81E08FB43dBEA72".parse().unwrap(),
@@ -93,6 +95,8 @@ forgetest!(can_extract_config_values, |prj: TestProject, mut cmd: TestCommand| {
         allow_paths: vec![],
         rpc_endpoints: Default::default(),
         build_info: false,
+        build_info_path: None,
+        fmt: Default::default(),
         __non_exhaustive: (),
     };
     prj.write_config(input.clone());
@@ -127,10 +131,7 @@ forgetest_init!(
 
         // ensure remappings contain test
         assert_eq!(profile.remappings.len(), 2);
-        assert_eq!(
-            "ds-test/=lib/forge-std/lib/ds-test/src/".to_string(),
-            profile.remappings[0].to_string()
-        );
+        assert_eq!("ds-test/=lib/forge-std/lib/ds-test/src/", profile.remappings[0].to_string());
         // the loaded config has resolved, absolute paths
         assert_eq!(
             "ds-test/=lib/forge-std/lib/ds-test/src/",
@@ -148,7 +149,7 @@ forgetest_init!(
         assert_eq!(
             format!(
                 "ds-test/={}/",
-                prj.root().join("lib/forge-std/lib/ds-test/from-file").display()
+                prj.root().join("lib/forge-std/lib/ds-test/from-file").to_slash_lossy()
             ),
             Remapping::from(config.remappings[0].clone()).to_string()
         );
@@ -159,7 +160,7 @@ forgetest_init!(
         assert_eq!(
             format!(
                 "ds-test/={}/",
-                prj.root().join("lib/forge-std/lib/ds-test/from-env").display()
+                prj.root().join("lib/forge-std/lib/ds-test/from-env").to_slash_lossy()
             ),
             Remapping::from(config.remappings[0].clone()).to_string()
         );
@@ -169,7 +170,7 @@ forgetest_init!(
         assert_eq!(
             format!(
                 "ds-test/={}/",
-                prj.root().join("lib/forge-std/lib/ds-test/from-cli").display()
+                prj.root().join("lib/forge-std/lib/ds-test/from-cli").to_slash_lossy()
             ),
             Remapping::from(config.remappings[0].clone()).to_string()
         );
@@ -177,7 +178,7 @@ forgetest_init!(
         let config = prj.config_from_output(["--remappings", "other-key/=lib/other/"]);
         assert_eq!(config.remappings.len(), 3);
         assert_eq!(
-            format!("other-key/={}/", prj.root().join("lib/other").display()),
+            format!("other-key/={}/", prj.root().join("lib/other").to_slash_lossy()),
             Remapping::from(config.remappings[2].clone()).to_string()
         );
 
@@ -383,7 +384,7 @@ forgetest_init!(can_detect_lib_foundry_toml, |prj: TestProject, mut cmd: TestCom
         remappings,
         vec![
             "ds-test/=lib/forge-std/lib/ds-test/src/".parse().unwrap(),
-            "forge-std/=lib/forge-std/src/".parse().unwrap()
+            "forge-std/=lib/forge-std/src/".parse().unwrap(),
         ]
     );
     // create a new lib directly in the `lib` folder

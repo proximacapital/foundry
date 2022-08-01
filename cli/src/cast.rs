@@ -140,6 +140,24 @@ async fn main() -> eyre::Result<()> {
             let val = unwrap_or_stdin(value)?;
             println!("{}", SimpleCast::to_int256(&val)?);
         }
+        Subcommands::LeftShift { value, bits, base_in, base_out } => {
+            println!(
+                "{}",
+                format_uint(
+                    SimpleCast::left_shift(&value, &bits, det_base_in(&value, base_in)?)?,
+                    det_base_out(&base_out)?
+                )?
+            );
+        }
+        Subcommands::RightShift { value, bits, base_in, base_out } => {
+            println!(
+                "{}",
+                format_uint(
+                    SimpleCast::right_shift(&value, &bits, det_base_in(&value, base_in)?)?,
+                    det_base_out(&base_out)?
+                )?
+            );
+        }
         Subcommands::ToUnit { value, unit } => {
             let val = unwrap_or_stdin(value)?;
             println!("{}", SimpleCast::to_unit(val, unit)?);
@@ -179,7 +197,7 @@ async fn main() -> eyre::Result<()> {
             )?;
 
             let chain: Chain = if let Some(chain) = eth.chain {
-                chain.into()
+                chain
             } else {
                 provider.get_chainid().await?.into()
             };
@@ -209,7 +227,7 @@ async fn main() -> eyre::Result<()> {
             )?;
 
             let chain: Chain = if let Some(chain) = eth.chain {
-                chain.into()
+                chain
             } else {
                 provider.get_chainid().await?.into()
             };
@@ -247,7 +265,7 @@ async fn main() -> eyre::Result<()> {
             let pubkey = Address::from_str(&address).expect("invalid pubkey provided");
             let provider = Provider::try_from(rpc_url)?;
             let addr = Cast::new(&provider).compute_address(pubkey, nonce).await?;
-            println!("Computed Address: {:?}", addr);
+            println!("Computed Address: {}", SimpleCast::checksum_address(&addr)?);
         }
         Subcommands::Code { block, who, rpc_url } => {
             let rpc_url = consume_config_rpc_url(rpc_url);
@@ -279,7 +297,7 @@ async fn main() -> eyre::Result<()> {
                 false,
             );
             let chain: Chain = if let Some(chain) = eth.chain {
-                chain.into()
+                chain
             } else {
                 provider.get_chainid().await?.into()
             };
@@ -291,6 +309,14 @@ async fn main() -> eyre::Result<()> {
                     WalletType::Local(local) => local.address(),
                     WalletType::Trezor(trezor) => trezor.address(),
                 };
+
+                // prevent misconfigured hwlib from sending a transaction that defies
+                // user-specified --from
+                if let Some(specified_from) = eth.wallet.from {
+                    if specified_from != from {
+                        eyre::bail!("The specified sender via CLI/env vars does not match the sender configured via the hardware wallet's HD Path. Please use the `--hd-path <PATH>` parameter to specify the BIP32 Path which corresponds to the sender. This will be automatically detected in the future: https://github.com/foundry-rs/foundry/issues/2289")
+                    }
+                }
 
                 if resend {
                     tx.nonce = Some(provider.get_transaction_count(from, None).await?);
@@ -412,7 +438,7 @@ async fn main() -> eyre::Result<()> {
             )?;
 
             let chain: Chain = if let Some(chain) = eth.chain {
-                chain.into()
+                chain
             } else {
                 provider.get_chainid().await?.into()
             };
@@ -595,7 +621,7 @@ async fn main() -> eyre::Result<()> {
                     name, who
                 );
             }
-            println!("{:?}", address);
+            println!("{}", SimpleCast::checksum_address(&address)?);
         }
         Subcommands::LookupAddress { who, rpc_url, verify } => {
             let rpc_url = consume_config_rpc_url(rpc_url);
@@ -700,6 +726,42 @@ where
             T::from_str(&what.replace('\n', ""))?
         }
     })
+}
+
+fn det_base_in(value: &str, base_in: Option<String>) -> eyre::Result<u32> {
+    match base_in {
+        Some(base_in) => match base_in.as_str() {
+            "10" | "dec" => Ok(10),
+            "16" | "hex" => Ok(16),
+            _ => eyre::bail!("Unknown input base: {base_in}"),
+        },
+        None if value.starts_with("0x") => Ok(16),
+        None => match U256::from_str_radix(value, 10) {
+            Ok(_) => {
+                eyre::bail!("Could not autodetect input base: input could be decimal or hexadecimal. Please prepend with 0x if the input is hexadecimal, or specify a --base-in parameter.");
+            }
+            Err(_) => {
+                U256::from_str_radix(value, 16).expect("Could not autodetect input base.");
+                Ok(16)
+            }
+        },
+    }
+}
+
+fn det_base_out(base_out: &str) -> eyre::Result<u32> {
+    match base_out {
+        "10" | "dec" => Ok(10),
+        "16" | "hex" => Ok(16),
+        _ => eyre::bail!("Provided base is not a valid."),
+    }
+}
+
+fn format_uint(val: U256, base_out: u32) -> eyre::Result<String> {
+    match base_out {
+        10 => Ok(val.to_string()),
+        16 => Ok(format!("0x{:x}", val)),
+        _ => Err(eyre::eyre!("Unknown output base: {base_out}")),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

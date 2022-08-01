@@ -141,6 +141,40 @@ The input can be:
         #[clap(value_name = "VALUE")]
         value: Option<String>,
     },
+    #[clap(name = "shl")]
+    #[clap(about = "Perform a left shifting operation")]
+    LeftShift {
+        #[clap(value_name = "VALUE")]
+        value: String,
+        #[clap(value_name = "BITS")]
+        bits: String,
+        #[clap(long = "--base-in", help = "The input base")]
+        base_in: Option<String>,
+        #[clap(
+            long = "--base-out",
+            help = "The output base",
+            default_value = "16",
+            parse(try_from_str = parse_base)
+        )]
+        base_out: String,
+    },
+    #[clap(name = "shr")]
+    #[clap(about = "Perform a right shifting operation")]
+    RightShift {
+        #[clap(value_name = "VALUE")]
+        value: String,
+        #[clap(value_name = "BITS")]
+        bits: String,
+        #[clap(long = "--base-in", help = "The input base")]
+        base_in: Option<String>,
+        #[clap(
+            long = "--base-out",
+            help = "The output base",
+            default_value = "16",
+            parse(try_from_str = parse_base)
+        )]
+        base_out: String,
+    },
     #[clap(name = "--to-unit")]
     #[clap(visible_aliases = &["to-unit", "tun", "2un"])]
     #[clap(
@@ -340,7 +374,13 @@ Examples:
             value_name = "CONFIRMATIONS"
         )]
         confirmations: usize,
-        #[clap(long, env = "CAST_ASYNC")]
+        #[clap(
+            long = "async",
+            env = "CAST_ASYNC",
+            name = "async",
+            alias = "cast-async",
+            help = "Exit immediately if the transaction was not found."
+        )]
         cast_async: bool,
         #[clap(long = "json", short = 'j', help_heading = "DISPLAY OPTIONS")]
         to_json: bool,
@@ -361,7 +401,13 @@ Examples:
         sig: Option<String>,
         #[clap(help = "The arguments of the function to call.", value_name = "ARGS")]
         args: Vec<String>,
-        #[clap(long, env = "CAST_ASYNC")]
+        #[clap(
+            long = "async",
+            env = "CAST_ASYNC",
+            name = "async",
+            alias = "cast-async",
+            help = "Only print the transaction hash and exit immediately."
+        )]
         cast_async: bool,
         #[clap(flatten, next_help_heading = "TRANSACTION OPTIONS")]
         tx: TransactionOpts,
@@ -390,7 +436,13 @@ Examples:
     PublishTx {
         #[clap(help = "The raw transaction", value_name = "RAW_TX")]
         raw_tx: String,
-        #[clap(long, env = "CAST_ASYNC")]
+        #[clap(
+            long = "async",
+            env = "CAST_ASYNC",
+            name = "async",
+            alias = "cast-async",
+            help = "Only print the transaction hash and exit immediately."
+        )]
         cast_async: bool,
         // FIXME: We only need the RPC URL and `--flashbots` options from this.
         #[clap(flatten)]
@@ -499,14 +551,16 @@ Defaults to decoding output data. To decode input data pass --input or use cast 
     },
     #[clap(name = "upload-signature")]
     #[clap(visible_aliases = &["ups"])]
-    #[clap(about = r#"Upload the given signatures to https://sig.eth.samczsun.com.
+    #[clap(
+        about = "Upload the given signatures to https://sig.eth.samczsun.com.",
+        long_about = r#"Upload the given signatures to https://sig.eth.samczsun.com.
 
-    Examples:
-    - cast upload-signature "transfer(address,uint256)"
-    - cast upload-signature "function transfer(address,uint256)"
-    - cast upload-signature "function transfer(address,uint256)" "event Transfer(address,address,uint256)"
-    - cast upload-signature ./out/Contract.sol/Contract.json
-    "#)]
+Examples:
+- cast upload-signature "transfer(address,uint256)"
+- cast upload-signature "function transfer(address,uint256)"
+- cast upload-signature "function transfer(address,uint256)" "event Transfer(address,address,uint256)"
+- cast upload-signature ./out/Contract.sol/Contract.json""#
+    )]
     UploadSignature {
         #[clap(
             help = "The signatures to upload. Prefix with 'function', 'event', or 'error'. Defaults to function if no prefix given. Can also take paths to contract artifact JSON."
@@ -818,5 +872,13 @@ fn parse_slot(s: &str) -> eyre::Result<H256> {
         H256::from_str(&padded)?
     } else {
         H256::from_low_u64_be(u64::from_str(s)?)
+    })
+}
+
+fn parse_base(s: &str) -> eyre::Result<String> {
+    Ok(match s {
+        "10" | "dec" => "10".to_string(),
+        "16" | "hex" => "16".to_string(),
+        _ => eyre::bail!("Provided base is not a valid."),
     })
 }

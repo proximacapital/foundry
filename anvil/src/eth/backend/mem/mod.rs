@@ -5,7 +5,7 @@ use crate::{
         backend::{
             cheats,
             cheats::CheatsManager,
-            db::Db,
+            db::{Db, SerializableState},
             executor::{EvmExecutorLock, ExecutedTransactions, TransactionExecutor},
             fork::ClientFork,
             genesis::GenesisConfig,
@@ -27,9 +27,10 @@ use crate::{
 use anvil_core::{
     eth::{
         block::{Block, BlockInfo, Header},
-        call::CallRequest,
         receipt::{EIP658Receipt, TypedReceipt},
-        transaction::{PendingTransaction, TransactionInfo, TypedTransaction},
+        transaction::{
+            EthTransactionRequest, PendingTransaction, TransactionInfo, TypedTransaction,
+        },
         utils::to_access_list,
     },
     types::{Forking, Index},
@@ -98,7 +99,7 @@ pub struct Backend {
 impl Backend {
     /// Create a new instance of in-mem backend.
     pub fn new(db: Arc<RwLock<dyn Db>>, env: Arc<RwLock<Env>>, fees: FeeManager) -> Self {
-        let blockchain = Blockchain::new(&*env.read(), fees.is_eip1559().then(|| fees.base_fee()));
+        let blockchain = Blockchain::new(&env.read(), fees.is_eip1559().then(|| fees.base_fee()));
         Self {
             db,
             blockchain,
@@ -135,7 +136,7 @@ impl Backend {
             trace!(target: "backend", "using forked blockchain at {}", fork.block_number());
             Blockchain::forked(fork.block_number(), fork.block_hash())
         } else {
-            Blockchain::new(&*env.read(), fees.is_eip1559().then(|| fees.base_fee()))
+            Blockchain::new(&env.read(), fees.is_eip1559().then(|| fees.base_fee()))
         };
 
         let backend = Self {
@@ -406,6 +407,35 @@ impl Backend {
         self.db.write().revert(id)
     }
 
+    /// Write all chain data to serialized bytes buffer
+    pub fn dump_state(&self) -> Result<Bytes, BlockchainError> {
+        self.db
+            .read()
+            .dump_state()
+            .map(|s| serde_json::to_vec(&s).unwrap_or_default().into())
+            .ok_or_else(|| {
+                RpcError::invalid_params(
+                    "Dumping state not supported with the current configuration",
+                )
+                .into()
+            })
+    }
+
+    /// Deserialize and add all chain data to the backend storage
+    pub fn load_state(&self, buf: Bytes) -> Result<bool, BlockchainError> {
+        let state: SerializableState =
+            serde_json::from_slice(&buf.0).map_err(|_| BlockchainError::FailedToDecodeStateDump)?;
+
+        if !self.db.write().load_state(state) {
+            Err(RpcError::invalid_params(
+                "Loading state not supported with the current configuration",
+            )
+            .into())
+        } else {
+            Ok(true)
+        }
+    }
+
     /// Returns the environment for the next block
     fn next_env(&self) -> Env {
         let mut env = self.env.read().clone();
@@ -478,31 +508,34 @@ impl Backend {
             let _lock = self.executor_lock.write().await;
 
             let current_base_fee = self.base_fee();
-            // acquire all locks
-            let mut env = self.env.write();
-            let mut db = self.db.write();
-            let mut storage = self.blockchain.storage.write();
 
-            // store current state
-            self.states.write().insert(storage.best_hash, db.current_state());
-
+            let mut env = self.env.read().clone();
             // increase block number for this block
             env.block.number = env.block.number.saturating_add(U256::one());
             env.block.basefee = current_base_fee;
             env.block.timestamp = self.time.next_timestamp().into();
 
-            let executor = TransactionExecutor {
-                db: &mut *db,
-                validator: self,
-                pending: pool_transactions.into_iter(),
-                block_env: env.block.clone(),
-                cfg_env: env.cfg.clone(),
-                parent_hash: storage.best_hash,
-                gas_used: U256::zero(),
+            let best_hash = self.blockchain.storage.read().best_hash;
+
+            // store current state before executing all transactions
+            self.states.write().insert(best_hash, self.db.read().current_state());
+
+            let executed_tx = {
+                let mut db = self.db.write();
+                let executor = TransactionExecutor {
+                    db: &mut *db,
+                    validator: self,
+                    pending: pool_transactions.into_iter(),
+                    block_env: env.block.clone(),
+                    cfg_env: env.cfg.clone(),
+                    parent_hash: best_hash,
+                    gas_used: U256::zero(),
+                };
+                executor.execute()
             };
 
             // create the new block with the current timestamp
-            let ExecutedTransactions { block, included, invalid } = executor.execute();
+            let ExecutedTransactions { block, included, invalid } = executed_tx;
             let BlockInfo { block, transactions, receipts } = block;
 
             let header = block.header.clone();
@@ -518,6 +551,7 @@ impl Backend {
                 transactions.iter().map(|tx| tx.transaction_hash).collect::<Vec<_>>()
             );
 
+            let mut storage = self.blockchain.storage.write();
             // update block metadata
             storage.best_number = block_number;
             storage.best_hash = block_hash;
@@ -545,6 +579,10 @@ impl Backend {
                 };
                 storage.transactions.insert(mined_tx.info.transaction_hash, mined_tx);
             }
+
+            // update env with new values
+            *self.env.write() = env;
+
             let timestamp = utc_from_secs(header.timestamp);
 
             node_info!("    Block Number: {}", block_number);
@@ -570,22 +608,20 @@ impl Backend {
         outcome
     }
 
-    /// Executes the `CallRequest` without writing to the DB
+    /// Executes the `EthTransactionRequest` without writing to the DB
     ///
     /// # Errors
     ///
     /// Returns an error if the `block_number` is greater than the current height
     pub async fn call(
         &self,
-        request: CallRequest,
+        request: EthTransactionRequest,
         fee_details: FeeDetails,
         block_number: Option<BlockNumber>,
     ) -> Result<(Return, TransactOut, u64, State), BlockchainError> {
-        trace!(target: "backend", "calling from [{:?}] fees={:?}", request.from, fee_details);
-
         let _lock = self.executor_lock.read().await;
 
-        let CallRequest { from, to, gas, value, data, nonce, access_list, .. } = request;
+        let EthTransactionRequest { from, to, gas, value, data, nonce, access_list, .. } = request;
 
         let FeeDetails { gas_price, max_fee_per_gas, max_priority_fee_per_gas } = fee_details;
 
@@ -609,13 +645,11 @@ impl Backend {
                 None => TransactTo::Create(CreateScheme::Create),
             },
             value: value.unwrap_or_default(),
-            data: data.unwrap_or_else(|| vec![].into()).to_vec().into(),
+            data: data.unwrap_or_default().to_vec().into(),
             chain_id: None,
             nonce: nonce.map(|n| n.as_u64()),
-            access_list: to_access_list(access_list.unwrap_or_default().0),
+            access_list: to_access_list(access_list.unwrap_or_default()),
         };
-
-        trace!(target: "backend", "calling with tx env from={:?} gas-limit={:?}, gas-price={:?}", env.tx.caller,  env.tx.gas_limit, env.tx.gas_limit);
 
         let block_number =
             U256::from(self.convert_block_number(block_number)).min(env.block.number);
@@ -1365,7 +1399,8 @@ impl TransactionValidator for Backend {
         tx: &PendingTransaction,
     ) -> Result<(), InvalidTransactionError> {
         let account = self.db.read().basic(*tx.sender());
-        self.validate_pool_transaction_for(tx, &account, &*self.env().read())
+        let env = self.next_env();
+        self.validate_pool_transaction_for(tx, &account, &env)
     }
 
     fn validate_pool_transaction_for(
@@ -1388,6 +1423,7 @@ impl TransactionValidator for Backend {
         }
 
         if (env.cfg.spec_id as u8) >= (SpecId::LONDON as u8) && tx.gas_price() < env.block.basefee {
+            warn!(target: "backend", "max fee per gas={}, too low, block basefee={}",tx.gas_price(),  env.block.basefee);
             return Err(InvalidTransactionError::FeeTooLow)
         }
 

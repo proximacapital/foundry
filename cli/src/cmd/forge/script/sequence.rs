@@ -1,5 +1,5 @@
 use super::{NestedValue, ScriptResult, VerifyBundle};
-use crate::cmd::forge::{create::RETRY_VERIFY_ON_CREATE, verify};
+use crate::cmd::forge::verify;
 use cast::executor::inspector::DEFAULT_CREATE2_DEPLOYER;
 use ethers::{
     abi::{Abi, Address},
@@ -19,6 +19,7 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+use tracing::trace;
 
 /// Helper that saves the transactions sequence and its state on which transactions have been
 /// broadcasted
@@ -58,29 +59,26 @@ impl ScriptSequence {
         })
     }
 
+    /// Loads The sequence for the correspondng json file
     pub fn load(
         config: &Config,
         sig: &str,
         target: &ArtifactId,
         chain_id: u64,
     ) -> eyre::Result<Self> {
-        let file = fs::read_to_string(ScriptSequence::get_path(
-            &config.broadcast,
-            sig,
-            target,
-            chain_id,
-        )?)?;
-        serde_json::from_str(&file).map_err(|e| e.into())
+        let path = ScriptSequence::get_path(&config.broadcast, sig, target, chain_id)?;
+        Ok(ethers::solc::utils::read_json_file(path)?)
     }
 
+    /// Saves the transactions as files
     pub fn save(&mut self) -> eyre::Result<()> {
         if !self.transactions.is_empty() {
             self.timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
             let path = self.path.to_string_lossy();
             //../run-latest.json
-            serde_json::to_writer(BufWriter::new(fs::create_file(&self.path)?), &self)?;
+            serde_json::to_writer_pretty(BufWriter::new(fs::create_file(&self.path)?), &self)?;
             //../run-[timestamp].json
-            serde_json::to_writer(
+            serde_json::to_writer_pretty(
                 BufWriter::new(fs::create_file(
                     path.replace("latest.json", &format!("{}.json", self.timestamp)),
                 )?),
@@ -97,17 +95,9 @@ impl ScriptSequence {
         self.receipts.push(receipt);
     }
 
+    /// Sorts all receipts with ascending transaction index
     pub fn sort_receipts(&mut self) {
-        self.receipts.sort_by(|a, b| {
-            // Safe since `block_number` is present in receipts.
-            let ablock = a.block_number.unwrap();
-            let bblock = b.block_number.unwrap();
-            if ablock == bblock {
-                a.transaction_index.cmp(&b.transaction_index)
-            } else {
-                ablock.cmp(&bblock)
-            }
-        });
+        self.receipts.sort_unstable()
     }
 
     pub fn add_pending(&mut self, index: usize, tx_hash: TxHash) {
@@ -144,7 +134,7 @@ impl ScriptSequence {
 
         let target_fname = target.source.file_name().wrap_err("No filename.")?;
         out.push(target_fname);
-        out.push(format!("{chain_id}"));
+        out.push(chain_id.to_string());
 
         fs::create_dir_all(&out)?;
 
@@ -156,6 +146,7 @@ impl ScriptSequence {
     /// Given the broadcast log, it matches transactions with receipts, and tries to verify any
     /// created contract on etherscan.
     pub async fn verify_contracts(&mut self, verify: VerifyBundle, chain: u64) -> eyre::Result<()> {
+        trace!(?chain, "verifying {} contracts", verify.known_contracts.len());
         if let Some(etherscan_key) = &verify.etherscan_key {
             let mut future_verifications = vec![];
 
@@ -212,7 +203,7 @@ impl ScriptSequence {
                                 flatten: false,
                                 force: false,
                                 watch: true,
-                                retry: RETRY_VERIFY_ON_CREATE,
+                                retry: verify.retry.clone(),
                                 libraries: self.libraries.clone(),
                             };
 
@@ -248,35 +239,47 @@ impl Drop for ScriptSequence {
 #[serde(rename_all = "camelCase")]
 pub struct TransactionWithMetadata {
     pub hash: Option<TxHash>,
-    #[serde(rename = "type")]
+    #[serde(rename = "transactionType")]
     pub opcode: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default = "default_string")]
     pub contract_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default = "default_address")]
     pub contract_address: Option<Address>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default = "default_string")]
     pub function: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default = "default_vec_of_strings")]
     pub arguments: Option<Vec<String>>,
-    pub tx: TypedTransaction,
+    pub transaction: TypedTransaction,
+}
+
+fn default_string() -> Option<String> {
+    Some("".to_owned())
+}
+
+fn default_address() -> Option<Address> {
+    Some(Address::from_low_u64_be(0))
+}
+
+fn default_vec_of_strings() -> Option<Vec<String>> {
+    Some(vec![])
 }
 
 impl TransactionWithMetadata {
     pub fn new(
-        tx: TypedTransaction,
+        transaction: TypedTransaction,
         result: &ScriptResult,
         local_contracts: &BTreeMap<Address, (String, &Abi)>,
         decoder: &CallTraceDecoder,
     ) -> eyre::Result<Self> {
-        let mut metadata = Self { tx, ..Default::default() };
+        let mut metadata = Self { transaction, ..Default::default() };
 
-        if let Some(NameOrAddress::Address(to)) = metadata.tx.to().cloned() {
+        if let Some(NameOrAddress::Address(to)) = metadata.transaction.to().cloned() {
             if to == DEFAULT_CREATE2_DEPLOYER {
                 metadata.set_create(true, Address::from_slice(&result.returned), local_contracts)
             } else {
                 metadata.set_call(to, local_contracts, decoder)?;
             }
-        } else if metadata.tx.to().is_none() {
+        } else if metadata.transaction.to().is_none() {
             metadata.set_create(
                 false,
                 result.address.expect("There should be a contract address."),
@@ -310,7 +313,7 @@ impl TransactionWithMetadata {
     ) -> eyre::Result<()> {
         self.opcode = "CALL".to_string();
 
-        if let Some(data) = self.tx.data() {
+        if let Some(data) = self.transaction.data() {
             if data.0.len() >= 4 {
                 if let Some((contract_name, abi)) = local_contracts.get(&target) {
                     // This CALL is made to a local contract.
@@ -348,23 +351,23 @@ impl TransactionWithMetadata {
     }
 
     pub fn set_tx(&mut self, tx: TypedTransaction) {
-        self.tx = tx;
+        self.transaction = tx;
     }
 
     pub fn change_type(&mut self, is_legacy: bool) {
-        self.tx = if is_legacy {
-            TypedTransaction::Legacy(self.tx.clone().into())
+        self.transaction = if is_legacy {
+            TypedTransaction::Legacy(self.transaction.clone().into())
         } else {
-            TypedTransaction::Eip1559(self.tx.clone().into())
+            TypedTransaction::Eip1559(self.transaction.clone().into())
         };
     }
 
     pub fn typed_tx(&self) -> &TypedTransaction {
-        &self.tx
+        &self.transaction
     }
 
     pub fn typed_tx_mut(&mut self) -> &mut TypedTransaction {
-        &mut self.tx
+        &mut self.transaction
     }
 
     pub fn is_create2(&self) -> bool {

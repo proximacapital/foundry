@@ -1,6 +1,7 @@
+use super::*;
 use crate::{
     cmd::{
-        forge::script::{sequence::TransactionWithMetadata, *},
+        forge::script::{runner::SimulationStage, sequence::TransactionWithMetadata},
         needs_setup,
     },
     utils,
@@ -10,10 +11,11 @@ use ethers::{
     types::{transaction::eip2718::TypedTransaction, Address, U256},
 };
 use forge::{
-    executor::{builder::Backend, inspector::CheatsConfig, ExecutorBuilder},
+    executor::{inspector::CheatsConfig, Backend, ExecutorBuilder},
     trace::CallTraceDecoder,
 };
 use std::collections::VecDeque;
+use tracing::trace;
 
 impl ScriptArgs {
     /// Locally deploys and executes the contract method that will collect all broadcastable
@@ -25,12 +27,13 @@ impl ScriptArgs {
         sender: Address,
         predeploy_libraries: &[ethers::types::Bytes],
     ) -> eyre::Result<ScriptResult> {
+        trace!("start executing script");
         let CompactContractBytecode { abi, bytecode, .. } = contract;
 
         let abi = abi.expect("no ABI for contract");
         let bytecode = bytecode.expect("no bytecode for contract").object.into_bytes().unwrap();
 
-        let mut runner = self.prepare_runner(script_config, sender).await;
+        let mut runner = self.prepare_runner(script_config, sender, SimulationStage::Local).await;
         let (address, mut result) = runner.setup(
             predeploy_libraries,
             bytecode,
@@ -71,11 +74,13 @@ impl ScriptArgs {
     pub async fn execute_transactions(
         &self,
         transactions: VecDeque<TypedTransaction>,
-        script_config: &ScriptConfig,
+        script_config: &mut ScriptConfig,
         decoder: &mut CallTraceDecoder,
         contracts: &BTreeMap<ArtifactId, (Abi, Vec<u8>)>,
     ) -> eyre::Result<VecDeque<TransactionWithMetadata>> {
-        let mut runner = self.prepare_runner(script_config, script_config.evm_opts.sender).await;
+        let mut runner = self
+            .prepare_runner(script_config, script_config.evm_opts.sender, SimulationStage::OnChain)
+            .await;
         let mut failed = false;
 
         if script_config.evm_opts.verbosity > 3 {
@@ -111,6 +116,11 @@ impl ScriptArgs {
                             tx.value,
                         )
                         .expect("Internal EVM error");
+
+                    // Simulate mining the transaction if the user passes `--slow`.
+                    if self.slow {
+                        runner.executor.env_mut().block.number += U256::one();
+                    }
 
                     // We inflate the gas used by the transaction by x1.3 since the estimation
                     // might be off
@@ -148,27 +158,33 @@ impl ScriptArgs {
     /// Creates the Runner that drives script execution
     async fn prepare_runner(
         &self,
-        script_config: &ScriptConfig,
+        script_config: &mut ScriptConfig,
         sender: Address,
-    ) -> ScriptRunner<Backend> {
+        stage: SimulationStage,
+    ) -> ScriptRunner {
+        trace!("preparing script runner");
         let env = script_config.evm_opts.evm_env().await;
 
-        // the db backend that serves all the data
-        let db = Backend::new(
-            utils::get_fork(&script_config.evm_opts, &script_config.config.rpc_storage_caching),
-            &env,
-        )
-        .await;
+        // The db backend that serves all the data.
+        let db = script_config.backend.clone().unwrap_or_else(|| {
+            let backend =
+                Backend::spawn(script_config.evm_opts.get_fork(&script_config.config, env.clone()));
+            script_config.backend = Some(backend.clone());
+            backend
+        });
 
-        let executor = ExecutorBuilder::default()
-            .with_cheatcodes(CheatsConfig::new(&script_config.config, &script_config.evm_opts))
+        let mut builder = ExecutorBuilder::default()
             .with_config(env)
-            .with_spec(crate::utils::evm_spec(&script_config.config.evm_version))
+            .with_spec(utils::evm_spec(&script_config.config.evm_version))
             .with_gas_limit(script_config.evm_opts.gas_limit())
-            .set_tracing(script_config.evm_opts.verbosity >= 3 || self.debug)
-            .set_debugger(self.debug)
-            .build(db);
+            .set_tracing(script_config.evm_opts.verbosity >= 3 || self.debug);
 
-        ScriptRunner::new(executor, script_config.evm_opts.initial_balance, sender)
+        if let SimulationStage::Local = stage {
+            builder = builder
+                .set_debugger(self.debug)
+                .with_cheatcodes(CheatsConfig::new(&script_config.config, &script_config.evm_opts));
+        }
+
+        ScriptRunner::new(builder.build(db), script_config.evm_opts.initial_balance, sender)
     }
 }
